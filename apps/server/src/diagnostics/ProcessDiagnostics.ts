@@ -4,7 +4,7 @@ import type {
   ServerProcessSignal,
   ServerSignalProcessResult,
 } from "@t3tools/contracts";
-import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import { HostProcessArchitecture, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
@@ -16,6 +16,7 @@ import * as ChildProcess from "effect/unstable/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 
 import { collectUint8StreamText } from "../stream/collectUint8StreamText.ts";
+import { readWindowsProcessResources } from "../windows/WindowsNativeSystem.ts";
 
 export interface ProcessRow {
   readonly pid: number;
@@ -201,53 +202,6 @@ export function parsePosixProcessRows(output: string): ReadonlyArray<ProcessRow>
   return rows;
 }
 
-function normalizeWindowsProcessRow(value: unknown): ProcessRow | null {
-  if (typeof value !== "object" || value === null) return null;
-  const record = value as Record<string, unknown>;
-  const pid = typeof record.ProcessId === "number" ? record.ProcessId : null;
-  const ppid = typeof record.ParentProcessId === "number" ? record.ParentProcessId : null;
-  const commandLine =
-    typeof record.CommandLine === "string" && record.CommandLine.trim().length > 0
-      ? record.CommandLine
-      : typeof record.Name === "string"
-        ? record.Name
-        : null;
-  const workingSet =
-    typeof record.WorkingSetSize === "number" && Number.isFinite(record.WorkingSetSize)
-      ? Math.max(0, Math.round(record.WorkingSetSize))
-      : 0;
-  const cpuPercent =
-    typeof record.PercentProcessorTime === "number" && Number.isFinite(record.PercentProcessorTime)
-      ? Math.max(0, record.PercentProcessorTime)
-      : 0;
-
-  if (!pid || pid <= 0 || ppid === null || ppid < 0 || !commandLine) return null;
-  return {
-    pid,
-    ppid,
-    pgid: null,
-    status: typeof record.Status === "string" && record.Status.length > 0 ? record.Status : "Live",
-    cpuPercent,
-    rssBytes: workingSet,
-    elapsed: "",
-    command: commandLine,
-  };
-}
-
-function parseWindowsProcessRows(output: string): ReadonlyArray<ProcessRow> {
-  if (output.trim().length === 0) return [];
-  try {
-    const parsed = JSON.parse(output) as unknown;
-    const records = Array.isArray(parsed) ? parsed : [parsed];
-    return records.flatMap((record) => {
-      const row = normalizeWindowsProcessRow(record);
-      return row ? [row] : [];
-    });
-  } catch {
-    return [];
-  }
-}
-
 export function buildDescendantEntries(
   rows: ReadonlyArray<ProcessRow>,
   serverPid: number,
@@ -344,9 +298,8 @@ const runProcess = Effect.fn("runProcess")(function* (input: {
   const cwd = process.cwd();
   return yield* Effect.gen(function* () {
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-    // `ps` and `powershell.exe` are real executables; spawning through cmd.exe
-    // shell mode would re-tokenize the PowerShell `-Command` payload (which
-    // contains pipes) before PowerShell ever sees it.
+    // Invoke `ps` directly so shell startup and tokenization cannot affect the
+    // stable argv-based output format parsed below.
     const child = yield* spawner.spawn(
       ChildProcess.make(input.command, input.args, {
         cwd,
@@ -439,38 +392,31 @@ function readPosixProcessRows(): Effect.Effect<
 
 function readWindowsProcessRows(): Effect.Effect<
   ReadonlyArray<ProcessRow>,
-  ProcessDiagnosticsError,
-  ChildProcessSpawner.ChildProcessSpawner
+  ProcessDiagnosticsError
 > {
-  const command = [
-    "$processes = Get-CimInstance Win32_Process | ForEach-Object {",
-    '$perf = Get-CimInstance Win32_PerfFormattedData_PerfProc_Process -Filter "IDProcess = $($_.ProcessId)" -ErrorAction SilentlyContinue;',
-    "[pscustomobject]@{ ProcessId = $_.ProcessId; ParentProcessId = $_.ParentProcessId; Name = $_.Name; CommandLine = $_.CommandLine; Status = $_.Status; WorkingSetSize = $_.WorkingSetSize; PercentProcessorTime = if ($perf) { $perf.PercentProcessorTime } else { 0 } }",
-    "};",
-    "$processes | ConvertTo-Json -Compress -Depth 3",
-  ].join(" ");
-
-  return runProcess({
-    command: "powershell.exe",
-    args: ["-NoProfile", "-NonInteractive", "-Command", command],
-  }).pipe(
-    Effect.flatMap((result) =>
-      result.exitCode !== 0
-        ? Effect.fail(
-            new ProcessDiagnosticsQueryFailedError({
-              command: "powershell.exe",
-              argCount: 4,
-              cwd: result.cwd,
-              exitCode: result.exitCode,
-              stdoutBytes: result.stdoutBytes,
-              stderrBytes: result.stderrBytes,
-              stdoutTruncated: result.stdoutTruncated,
-              stderrTruncated: result.stderrTruncated,
-            }),
-          )
-        : Effect.succeed(parseWindowsProcessRows(result.stdout)),
-    ),
-  );
+  return Effect.gen(function* () {
+    const architecture = yield* HostProcessArchitecture;
+    return yield* Effect.try({
+      try: () =>
+        readWindowsProcessResources(process.pid, architecture).map<ProcessRow>((row) => ({
+          pid: row.pid,
+          ppid: row.ppid,
+          pgid: null,
+          status: "Live",
+          cpuPercent: row.cpuPercent,
+          rssBytes: row.rssBytes,
+          elapsed: row.elapsed,
+          command: row.command,
+        })),
+      catch: (cause) =>
+        new ProcessDiagnosticsQueryFailedError({
+          command: "Win32 process APIs",
+          argCount: 0,
+          cwd: process.cwd(),
+          cause,
+        }),
+    });
+  });
 }
 
 export const readProcessRows = Effect.gen(function* () {

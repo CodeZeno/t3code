@@ -294,9 +294,10 @@ export function createServerEnvironmentAtoms<R, E>(
       label: "environment-data:server:process-diagnostics",
       tag: WS_METHODS.serverGetProcessDiagnostics,
     }),
-    processResourceHistory: createEnvironmentRpcQueryAtomFamily(runtime, {
+    processResourceHistory: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
       label: "environment-data:server:process-resource-history",
-      tag: WS_METHODS.serverGetProcessResourceHistory,
+      tag: WS_METHODS.subscribeServerProcessResourceHistory,
+      idleTtlMs: 0,
     }),
     configProjection,
     welcome: createEnvironmentRpcSubscriptionAtomFamily(runtime, {

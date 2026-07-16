@@ -586,6 +586,8 @@ const buildAppUnderTest = (options?: {
       ),
       Layer.provide(
         Layer.mock(ProcessResourceMonitor.ProcessResourceMonitor)({
+          retain: Effect.void,
+          sampleIntervalMs: 5_000,
           readHistory: (input) =>
             Effect.succeed({
               readAt: TEST_EPOCH,

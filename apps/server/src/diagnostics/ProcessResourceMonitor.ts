@@ -13,11 +13,13 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 
 import * as ProcessDiagnostics from "./ProcessDiagnostics.ts";
 
-const SAMPLE_INTERVAL_MS = 5_000;
+export const DEFAULT_SAMPLE_INTERVAL_MS = 15_000;
+const LEGACY_SAMPLE_INTERVAL_MS = 5_000;
 const RETENTION_MS = 60 * 60_000;
 const MAX_RETAINED_SAMPLES = 20_000;
 
@@ -49,6 +51,7 @@ export class ProcessResourceSamplingError extends Schema.TaggedErrorClass<Proces
 interface MonitorState {
   readonly samples: ReadonlyArray<ProcessResourceSample>;
   readonly lastFailure: ProcessResourceSamplingError | null;
+  readonly retainCount: number;
 }
 
 export class ProcessResourceMonitor extends Context.Service<
@@ -57,6 +60,8 @@ export class ProcessResourceMonitor extends Context.Service<
     readonly readHistory: (
       input: ServerProcessResourceHistoryInput,
     ) => Effect.Effect<ServerProcessResourceHistoryResult>;
+    readonly retain: Effect.Effect<void, never, Scope.Scope>;
+    readonly sampleIntervalMs: number;
   }
 >()("t3/diagnostics/ProcessResourceMonitor") {}
 
@@ -134,6 +139,7 @@ function trimSamples(
 
 function summarizeProcesses(
   samples: ReadonlyArray<ProcessResourceSample>,
+  sampleIntervalMs: number,
 ): ReadonlyArray<ServerProcessResourceHistorySummary> {
   const groups = new Map<string, ProcessResourceSample[]>();
   for (const sample of samples) {
@@ -151,7 +157,7 @@ function summarizeProcesses(
       const maxCpuPercent = Math.max(...sorted.map((sample) => sample.cpuPercent));
       const maxRssBytes = Math.max(...sorted.map((sample) => sample.rssBytes));
       const cpuSecondsApprox = sorted.reduce(
-        (total, sample) => total + (sample.cpuPercent / 100) * (SAMPLE_INTERVAL_MS / 1_000),
+        (total, sample) => total + (sample.cpuPercent / 100) * (sampleIntervalMs / 1_000),
         0,
       );
 
@@ -234,14 +240,16 @@ export function aggregateProcessResourceHistory(input: {
   readonly windowMs: number;
   readonly bucketMs: number;
   readonly lastFailure: ProcessResourceSamplingError | null;
+  readonly sampleIntervalMs?: number;
 }): ServerProcessResourceHistoryResult {
+  const sampleIntervalMs = input.sampleIntervalMs ?? LEGACY_SAMPLE_INTERVAL_MS;
   const windowMs = Math.max(1_000, input.windowMs);
   const bucketMs = Math.max(1_000, input.bucketMs);
   const minSampledAtMs = input.readAtMs - windowMs;
   const samples = input.samples.filter((sample) => sample.sampledAtMs >= minSampledAtMs);
-  const topProcesses = summarizeProcesses(samples);
+  const topProcesses = summarizeProcesses(samples, sampleIntervalMs);
   const totalCpuSecondsApprox = samples.reduce(
-    (total, sample) => total + (sample.cpuPercent / 100) * (SAMPLE_INTERVAL_MS / 1_000),
+    (total, sample) => total + (sample.cpuPercent / 100) * (sampleIntervalMs / 1_000),
     0,
   );
 
@@ -249,7 +257,7 @@ export function aggregateProcessResourceHistory(input: {
     readAt: input.readAt,
     windowMs,
     bucketMs,
-    sampleIntervalMs: SAMPLE_INTERVAL_MS,
+    sampleIntervalMs,
     retainedSampleCount: input.samples.length,
     totalCpuSecondsApprox,
     buckets: buildBuckets({ samples, nowMs: input.readAtMs, windowMs, bucketMs }),
@@ -265,7 +273,19 @@ export function aggregateProcessResourceHistory(input: {
 
 export const make = Effect.gen(function* () {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-  const state = yield* Ref.make<MonitorState>({ samples: [], lastFailure: null });
+  const configuredIntervalMs = Number(process.env.T3CODE_PROCESS_RESOURCE_SAMPLE_INTERVAL_MS);
+  const sampleIntervalMs =
+    Number.isFinite(configuredIntervalMs) && configuredIntervalMs >= 1_000
+      ? configuredIntervalMs
+      : DEFAULT_SAMPLE_INTERVAL_MS;
+  const enabled = !["0", "false", "off"].includes(
+    (process.env.T3CODE_PROCESS_RESOURCE_MONITOR ?? "true").toLowerCase(),
+  );
+  const state = yield* Ref.make<MonitorState>({
+    samples: [],
+    lastFailure: null,
+    retainCount: 0,
+  });
 
   const recordSamplingFailure = (cause: {
     readonly _tag: ServerProcessResourceHistoryFailureTagType;
@@ -291,6 +311,7 @@ export const make = Effect.gen(function* () {
       sampledAtMs,
     });
     yield* Ref.update(state, (current) => ({
+      ...current,
       samples: trimSamples([...current.samples, ...samples], sampledAtMs),
       lastFailure: null,
     }));
@@ -304,8 +325,26 @@ export const make = Effect.gen(function* () {
     }),
   );
 
-  yield* Effect.forever(sampleOnce.pipe(Effect.andThen(Effect.sleep(SAMPLE_INTERVAL_MS)))).pipe(
-    Effect.forkScoped,
+  yield* Effect.forever(
+    Effect.sleep(sampleIntervalMs).pipe(
+      Effect.andThen(Ref.get(state)),
+      Effect.flatMap((current) => (enabled && current.retainCount > 0 ? sampleOnce : Effect.void)),
+    ),
+  ).pipe(Effect.forkScoped);
+
+  const retain: ProcessResourceMonitor["Service"]["retain"] = Effect.acquireRelease(
+    Ref.modify(state, (current) => [
+      current.retainCount === 0,
+      { ...current, retainCount: current.retainCount + 1 },
+    ]).pipe(
+      Effect.flatMap((wasIdle) => (enabled && wasIdle ? sampleOnce : Effect.void)),
+      Effect.asVoid,
+    ),
+    () =>
+      Ref.update(state, (current) => ({
+        ...current,
+        retainCount: Math.max(0, current.retainCount - 1),
+      })),
   );
 
   const readHistory: ProcessResourceMonitor["Service"]["readHistory"] = (input) =>
@@ -320,10 +359,11 @@ export const make = Effect.gen(function* () {
         windowMs: input.windowMs,
         bucketMs: input.bucketMs,
         lastFailure: current.lastFailure,
+        sampleIntervalMs,
       });
     });
 
-  return ProcessResourceMonitor.of({ readHistory });
+  return ProcessResourceMonitor.of({ readHistory, retain, sampleIntervalMs });
 });
 
 export const layer = Layer.effect(ProcessResourceMonitor, make);

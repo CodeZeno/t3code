@@ -33,7 +33,7 @@ import {
   type TerminalWriteInput,
 } from "@t3tools/contracts";
 import { makeKeyedCoalescingWorker } from "@t3tools/shared/KeyedCoalescingWorker";
-import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import { HostProcessArchitecture, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { getTerminalLabel } from "@t3tools/shared/terminalLabels";
 import * as DateTime from "effect/DateTime";
 import * as Context from "effect/Context";
@@ -59,6 +59,7 @@ import {
 } from "../observability/Metrics.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as PortScanner from "../preview/PortScanner.ts";
+import { collectProcessTreeIds, readWindowsProcessTree } from "../windows/WindowsNativeSystem.ts";
 import * as PtyAdapter from "./PtyAdapter.ts";
 
 export {
@@ -76,7 +77,7 @@ export {
 
 const DEFAULT_HISTORY_LINE_LIMIT = 5_000;
 const DEFAULT_PERSIST_DEBOUNCE_MS = 40;
-const DEFAULT_SUBPROCESS_POLL_INTERVAL_MS = 1_000;
+const DEFAULT_SUBPROCESS_POLL_INTERVAL_MS = 2_000;
 const DEFAULT_PROCESS_KILL_GRACE_MS = 1_000;
 const DEFAULT_MAX_RETAINED_INACTIVE_SESSIONS = 128;
 const DEFAULT_OPEN_COLS = 120;
@@ -90,7 +91,7 @@ class TerminalSubprocessCheckError extends Schema.TaggedErrorClass<TerminalSubpr
   {
     cause: Schema.optional(Schema.Defect()),
     terminalPid: Schema.Number,
-    command: Schema.Literals(["powershell", "pgrep", "ps"]),
+    command: Schema.Literals(["win32", "pgrep", "ps"]),
   },
 ) {
   override get message(): string {
@@ -623,74 +624,29 @@ function parseFirstChildPidFromPgrep(stdout: string): number | null {
 function windowsInspectSubprocess(
   terminalPid: number,
   platform: NodeJS.Platform,
-): Effect.Effect<
-  TerminalSubprocessInspectResult,
-  TerminalSubprocessCheckError,
-  ProcessRunner.ProcessRunner
-> {
-  const command =
-    'Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object { Write-Output "$($_.ProcessId)|$($_.ParentProcessId)|$($_.Name)" }';
-  return Effect.gen(function* () {
-    const processRunner = yield* ProcessRunner.ProcessRunner;
-    return yield* processRunner.run({
-      // powershell.exe is a real executable — never spawn it through cmd.exe
-      // shell mode, which would re-tokenize the `-Command` payload (pipes,
-      // semicolons) before PowerShell ever sees it.
-      command: "powershell.exe",
-      args: ["-NoProfile", "-NonInteractive", "-Command", command],
-      timeout: "1500 millis",
-      maxOutputBytes: 32_768,
-      outputMode: "truncate",
-      timeoutBehavior: "timedOutResult",
-    });
+  architecture: NodeJS.Architecture,
+): Effect.Effect<TerminalSubprocessInspectResult, TerminalSubprocessCheckError> {
+  return Effect.try({
+    try: () => {
+      const tree = readWindowsProcessTree(architecture);
+      return {
+        tree,
+        directChild: tree.find((row) => row.ppid === terminalPid),
+      };
+    },
+    catch: (cause) => new TerminalSubprocessCheckError({ cause, terminalPid, command: "win32" }),
   }).pipe(
     Effect.map((result) => {
-      if (result.code !== 0) {
+      if (result.directChild === undefined) {
         return { hasRunningSubprocess: false, childCommand: null, processIds: [] } as const;
       }
-      const processNameById = new Map<number, string>();
-      const childrenByParent = new Map<number, number[]>();
-      for (const line of result.stdout.split(/\r?\n/g)) {
-        const [pidRaw, parentPidRaw, nameRaw] = line.trim().split("|", 3);
-        const pid = Number(pidRaw);
-        const parentPid = Number(parentPidRaw);
-        if (!Number.isInteger(pid) || !Number.isInteger(parentPid)) continue;
-        processNameById.set(pid, nameRaw?.trim() ?? "");
-        const children = childrenByParent.get(parentPid) ?? [];
-        children.push(pid);
-        childrenByParent.set(parentPid, children);
-      }
-      const directChildren = childrenByParent.get(terminalPid) ?? [];
-      const childPid = directChildren[0];
-      if (childPid === undefined) {
-        return { hasRunningSubprocess: false, childCommand: null, processIds: [] } as const;
-      }
-      const processIds = new Set<number>([terminalPid]);
-      const pending = [terminalPid];
-      while (pending.length > 0) {
-        const parentPid = pending.pop();
-        if (parentPid === undefined) continue;
-        for (const pid of childrenByParent.get(parentPid) ?? []) {
-          if (processIds.has(pid)) continue;
-          processIds.add(pid);
-          pending.push(pid);
-        }
-      }
-      const normalized = normalizeChildCommandName(processNameById.get(childPid) ?? "", platform);
+      const normalized = normalizeChildCommandName(result.directChild.name, platform);
       return {
         hasRunningSubprocess: true,
         childCommand: normalized ? truncateTerminalWireLabel(normalized) : null,
-        processIds: [...processIds],
+        processIds: [...collectProcessTreeIds(result.tree, terminalPid)],
       } as const;
     }),
-    Effect.mapError(
-      (cause) =>
-        new TerminalSubprocessCheckError({
-          cause,
-          terminalPid,
-          command: "powershell",
-        }),
-    ),
   );
 }
 
@@ -840,13 +796,16 @@ const posixInspectSubprocess = Effect.fn("terminal.posixInspectSubprocess")(func
   };
 });
 
-function defaultSubprocessInspectorForPlatform(platform: NodeJS.Platform) {
+function defaultSubprocessInspectorForPlatform(
+  platform: NodeJS.Platform,
+  architecture: NodeJS.Architecture,
+) {
   return Effect.fn("terminal.defaultSubprocessInspector")(function* (terminalPid: number) {
     if (!Number.isInteger(terminalPid) || terminalPid <= 0) {
       return { hasRunningSubprocess: false, childCommand: null, processIds: [] };
     }
     if (platform === "win32") {
-      return yield* windowsInspectSubprocess(terminalPid, platform);
+      return yield* windowsInspectSubprocess(terminalPid, platform, architecture);
     }
     return yield* posixInspectSubprocess(terminalPid, platform);
   });
@@ -1136,6 +1095,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
   const logsDir = options.logsDir;
   const historyLineLimit = options.historyLineLimit ?? DEFAULT_HISTORY_LINE_LIMIT;
   const platform = yield* HostProcessPlatform;
+  const architecture = yield* HostProcessArchitecture;
   // Terminals must inherit the user's full environment (minus the blocklist
   // applied in createTerminalSpawnEnv) — an allowlist here silently strips
   // things like PSModulePath, DISPLAY, proxies, and toolchain variables.
@@ -1146,11 +1106,18 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
   const subprocessInspector =
     options.subprocessInspector ??
     ((terminalPid) =>
-      defaultSubprocessInspectorForPlatform(platform)(terminalPid).pipe(
-        Effect.provideService(ProcessRunner.ProcessRunner, processRunner),
-      ));
+      defaultSubprocessInspectorForPlatform(
+        platform,
+        architecture,
+      )(terminalPid).pipe(Effect.provideService(ProcessRunner.ProcessRunner, processRunner)));
   const subprocessPollIntervalMs =
-    options.subprocessPollIntervalMs ?? DEFAULT_SUBPROCESS_POLL_INTERVAL_MS;
+    options.subprocessPollIntervalMs ??
+    (() => {
+      const configured = Number(baseEnv.T3CODE_TERMINAL_PROCESS_POLL_INTERVAL_MS);
+      return Number.isFinite(configured) && configured >= 500
+        ? configured
+        : DEFAULT_SUBPROCESS_POLL_INTERVAL_MS;
+    })();
   const processKillGraceMs = options.processKillGraceMs ?? DEFAULT_PROCESS_KILL_GRACE_MS;
   const maxRetainedInactiveSessions =
     options.maxRetainedInactiveSessions ?? DEFAULT_MAX_RETAINED_INACTIVE_SESSIONS;

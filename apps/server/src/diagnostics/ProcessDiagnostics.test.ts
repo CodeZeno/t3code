@@ -208,6 +208,7 @@ describe("ProcessDiagnostics", () => {
       const diagnostics = yield* Effect.service(ProcessDiagnostics.ProcessDiagnostics).pipe(
         Effect.flatMap((pd) => pd.read),
         Effect.provide(layer),
+        Effect.provideService(HostProcessPlatform, "linux"),
       );
 
       expect(diagnostics.processes.map((process) => process.pid)).toEqual([4242]);
@@ -258,6 +259,27 @@ describe("ProcessDiagnostics", () => {
     }),
   );
 
+  it.effect("uses Win32 APIs without spawning a PowerShell helper", () =>
+    Effect.gen(function* () {
+      if ((yield* HostProcessPlatform) !== "win32") return;
+      let spawnCount = 0;
+      const spawnerLayer = Layer.succeed(
+        ChildProcessSpawner.ChildProcessSpawner,
+        ChildProcessSpawner.make(() => {
+          spawnCount += 1;
+          return Effect.die("Windows process diagnostics must not spawn a helper process");
+        }),
+      );
+
+      const rows = yield* ProcessDiagnostics.readProcessRows.pipe(
+        Effect.provide(spawnerLayer),
+        Effect.provideService(HostProcessPlatform, "win32"),
+      );
+      expect(rows.some((row) => row.pid === process.pid)).toBe(true);
+      expect(spawnCount).toBe(0);
+    }),
+  );
+
   it.effect("does not allow signaling the diagnostics query process", () =>
     Effect.gen(function* () {
       const spawnerLayer = Layer.succeed(
@@ -278,6 +300,7 @@ describe("ProcessDiagnostics", () => {
       const result = yield* Effect.service(ProcessDiagnostics.ProcessDiagnostics).pipe(
         Effect.flatMap((pd) => pd.signal({ pid: 4242, signal: "SIGINT" })),
         Effect.provide(layer),
+        Effect.provideService(HostProcessPlatform, "linux"),
       );
 
       expect(result).toEqual({

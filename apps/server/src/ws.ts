@@ -342,6 +342,7 @@ const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [WS_METHODS.previewAutomationFocusHost, AuthOrchestrationOperateScope],
   [WS_METHODS.subscribePreviewEvents, AuthOrchestrationReadScope],
   [WS_METHODS.subscribeDiscoveredLocalServers, AuthOrchestrationReadScope],
+  [WS_METHODS.subscribeServerProcessResourceHistory, AuthOrchestrationReadScope],
   [WS_METHODS.subscribeServerConfig, AuthOrchestrationReadScope],
   [WS_METHODS.subscribeServerLifecycle, AuthOrchestrationReadScope],
   [WS_METHODS.subscribeAuthAccess, AuthAccessReadScope],
@@ -1756,6 +1757,22 @@ const makeWsRpcLayer = (
               }),
             ),
             { "rpc.aggregate": "preview" },
+          ),
+        [WS_METHODS.subscribeServerProcessResourceHistory]: (input) =>
+          observeRpcStream(
+            WS_METHODS.subscribeServerProcessResourceHistory,
+            Stream.callback((queue) =>
+              Effect.gen(function* () {
+                yield* processResourceMonitor.retain;
+                yield* Effect.forever(
+                  processResourceMonitor.readHistory(input).pipe(
+                    Effect.flatMap((result) => Queue.offer(queue, result)),
+                    Effect.andThen(Effect.sleep(processResourceMonitor.sampleIntervalMs)),
+                  ),
+                ).pipe(Effect.forkScoped);
+              }),
+            ),
+            { "rpc.aggregate": "diagnostics" },
           ),
         [WS_METHODS.subscribeServerConfig]: (_input) =>
           observeRpcStreamEffect(

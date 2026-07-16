@@ -12,11 +12,12 @@
  * polls forever, but each tick is a no-op when the retain count is zero.
  */
 import { ThreadId, type DiscoveredLocalServer } from "@t3tools/contracts";
-import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import { HostProcessArchitecture, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Net from "@t3tools/shared/Net";
 import { LSOF_LOCAL_HOST_TOKENS } from "@t3tools/shared/preview";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
+import * as Data from "effect/Data";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -25,6 +26,7 @@ import * as Schedule from "effect/Schedule";
 import * as Scope from "effect/Scope";
 
 import * as ProcessRunner from "../processRunner.ts";
+import { readWindowsProcessTree, readWindowsTcpListeners } from "../windows/WindowsNativeSystem.ts";
 
 export class PortDiscovery extends Context.Service<
   PortDiscovery,
@@ -50,9 +52,14 @@ export const COMMON_DEV_PORTS: ReadonlyArray<number> = Object.freeze([
   3000, 3001, 3333, 4173, 4200, 4321, 5000, 5173, 5174, 5175, 5500, 8000, 8080, 8081, 8888, 9000,
 ]);
 
-const POLL_INTERVAL = Duration.seconds(3);
+const DEFAULT_POLL_INTERVAL_MS = 5_000;
+const configuredPollIntervalMs = Number(process.env.T3CODE_PREVIEW_PORT_POLL_INTERVAL_MS);
+const POLL_INTERVAL = Duration.millis(
+  Number.isFinite(configuredPollIntervalMs) && configuredPollIntervalMs >= 1_000
+    ? configuredPollIntervalMs
+    : DEFAULT_POLL_INTERVAL_MS,
+);
 const LSOF_TIMEOUT_MS = 5_000;
-const WINDOWS_LISTENER_TIMEOUT_MS = 5_000;
 
 type Listener = (servers: ReadonlyArray<DiscoveredLocalServer>) => Effect.Effect<void>;
 
@@ -73,6 +80,10 @@ interface TerminalProcessOwner {
   readonly threadId: ThreadId;
   readonly terminalId: string;
 }
+
+class WindowsListenerProbeError extends Data.TaggedError("WindowsListenerProbeError")<{
+  readonly cause: unknown;
+}> {}
 
 const terminalOwnerKey = (owner: {
   readonly threadId: string;
@@ -136,27 +147,23 @@ const parsePortFromLsofName = (name: string): number | null => {
   return port;
 };
 
-const parseWindowsListenerOutput = (
-  raw: string,
+const makeWindowsListenerSnapshot = (
+  architecture: NodeJS.Architecture,
   terminalByProcessId: ReadonlyMap<number, TerminalProcessOwner> = new Map(),
 ): ReadonlyArray<DiscoveredLocalServer> => {
   const seen = new Map<number, DiscoveredLocalServer>();
-  for (const line of raw.split(/\r?\n/g)) {
-    const [hostRaw, portRaw, pidRaw, processNameRaw] = line.trim().split("|", 4);
-    const host = hostRaw?.trim() ?? "";
-    if (!LSOF_LOCAL_HOST_TOKENS.has(host) && host !== "::") continue;
-    const port = Number(portRaw);
-    const pid = Number(pidRaw);
-    if (!Number.isInteger(port) || port <= 0 || port >= 65536) continue;
-    const normalizedPid = Number.isInteger(pid) && pid > 0 ? pid : null;
-    if (seen.has(port)) continue;
-    seen.set(port, {
+  const processNames = new Map(
+    readWindowsProcessTree(architecture).map((row) => [row.pid, row.name]),
+  );
+  for (const listener of readWindowsTcpListeners()) {
+    if (seen.has(listener.port)) continue;
+    seen.set(listener.port, {
       host: "localhost",
-      port,
-      url: `http://localhost:${port}`,
-      processName: processNameRaw?.trim() || null,
-      pid: normalizedPid,
-      terminal: normalizedPid === null ? null : (terminalByProcessId.get(normalizedPid) ?? null),
+      port: listener.port,
+      url: `http://localhost:${listener.port}`,
+      processName: processNames.get(listener.pid) ?? null,
+      pid: listener.pid,
+      terminal: terminalByProcessId.get(listener.pid) ?? null,
     });
   }
   return [...seen.values()].toSorted((left, right) => left.port - right.port);
@@ -190,6 +197,7 @@ export const make = Effect.gen(function* PortDiscoveryMake() {
   const net = yield* Net.NetService;
   const processRunner = yield* ProcessRunner.ProcessRunner;
   const hostPlatform = yield* HostProcessPlatform;
+  const hostArchitecture = yield* HostProcessArchitecture;
   const stateRef = yield* Ref.make<ScannerState>({
     lastSnapshot: [],
     listeners: new Set(),
@@ -238,27 +246,17 @@ export const make = Effect.gen(function* PortDiscoveryMake() {
       }
     }
     if (hostPlatform === "win32") {
-      const recoverWindowsProbeFailure = recoverProcessProbeFailure("windows-listeners");
-      const command =
-        'Get-NetTCPConnection -State Listen -ErrorAction Stop | ForEach-Object { $processName = (Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName; Write-Output "$($_.LocalAddress)|$($_.LocalPort)|$($_.OwningProcess)|$processName" }';
-      const listeners = yield* processRunner
-        .run({
-          command: "powershell.exe",
-          args: ["-NoProfile", "-NonInteractive", "-Command", command],
-          timeout: Duration.millis(WINDOWS_LISTENER_TIMEOUT_MS),
-          maxOutputBytes: 1024 * 1024,
-          outputMode: "truncate",
-        })
-        .pipe(
-          Effect.map((result) => parseWindowsListenerOutput(result.stdout, terminalByProcessId)),
-          Effect.catchTags({
-            ProcessSpawnError: recoverWindowsProbeFailure,
-            ProcessStdinError: recoverWindowsProbeFailure,
-            ProcessOutputLimitError: recoverWindowsProbeFailure,
-            ProcessReadError: recoverWindowsProbeFailure,
-            ProcessTimeoutError: recoverWindowsProbeFailure,
-          }),
-        );
+      const listeners = yield* Effect.try({
+        try: () => makeWindowsListenerSnapshot(hostArchitecture, terminalByProcessId),
+        catch: (cause) => new WindowsListenerProbeError({ cause }),
+      }).pipe(
+        Effect.catch((cause) =>
+          Effect.logDebug(
+            "native Windows preview port probe failed; falling back to common-port probes",
+            { cause, platform: hostPlatform },
+          ).pipe(Effect.as(null)),
+        ),
+      );
       if (listeners !== null) return listeners;
       return yield* probeCommonPorts();
     }
